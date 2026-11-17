@@ -9,10 +9,10 @@ const ROUTER_URL = process.env.OMNIROUTE_URL || 'http://localhost:20128';
 const REDIRECT_URI = `${ROUTER_URL}/callback`;
 const AKUN_FILE = path.resolve(__dirname, '../akun.txt');
 
-// Window SUPER KECIL di pojok layar (sekecil mungkin yg masih bisa Google render form)
+// Window SUPER KECIL di pojok layar (200 x 300)
 const WINDOW_WIDTH = 200;
 const WINDOW_HEIGHT = 300;
-const HEADLESS = false; // HARUS false — Google block form submit saat headless
+const HEADLESS = false; // Google block form submit saat headless
 
 async function askConcurrency(defaultVal = 10) {
   if (!process.stdin.isTTY) return defaultVal;
@@ -24,6 +24,31 @@ async function askConcurrency(defaultVal = 10) {
       if (!val) return resolve(defaultVal);
       const parsed = parseInt(val, 10);
       resolve(parsed > 0 ? parsed : defaultVal);
+    });
+  });
+}
+
+// Konfirmasi user saat terdeteksi error 403
+async function confirmContinueOn403(email, errorDetail) {
+  console.log(`\n===================================================================`);
+  console.log(`🚨 SENSOR AKTIF: TERDETEKSI ERROR 403 PADA GOOGLE ANTIGRAVITY!`);
+  console.log(`-------------------------------------------------------------------`);
+  console.log(`Akun     : ${email}`);
+  console.log(`Masalah  : ${errorDetail}`);
+  console.log(`Tindakan : Akun OTOMATIS DIHAPUS dari OmniRoute.`);
+  console.log(`===================================================================\n`);
+
+  if (!process.stdin.isTTY) {
+    console.log(`[!] Mode non-interaktif: Otomatis STOP INPUT demi keamanan pool.\n`);
+    return false;
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`[?] Apakah Anda SERIUS mau lanjut ke akun berikutnya? (ketik 'y' untuk lanjut, Enter untuk STOP): `, (ans) => {
+      rl.close();
+      const confirmed = ans.trim().toLowerCase() === 'y' || ans.trim().toLowerCase() === 'yes';
+      resolve(confirmed);
     });
   });
 }
@@ -85,6 +110,44 @@ async function exchangeToken(token, { code, codeVerifier, state }, retries = 4) 
     }
   }
   throw lastErr;
+}
+
+// SENSOR KESEHATAN KONEKSI (CEK 403 & VIOLATION)
+async function verifyConnectionHealth(token, connectionId) {
+  try {
+    const res = await apiRequest(`/api/providers/${encodeURIComponent(connectionId)}/test`, {
+      method: 'POST',
+      token,
+      body: {},
+      timeout: 20000
+    });
+    if (!res.ok) return { healthy: false, error: `HTTP ${res.status}` };
+    const data = res.data || {};
+    const errorMsg = data.error || data.warning || (data.diagnosis && data.diagnosis.message) || '';
+    const is403 = String(errorMsg).includes('403') ||
+                  String(errorMsg).toLowerCase().includes('disabled') ||
+                  String(errorMsg).toLowerCase().includes('violation') ||
+                  String(errorMsg).toLowerCase().includes('denied') ||
+                  data.statusCode === 403 ||
+                  data.valid === false;
+    return {
+      healthy: !is403 && data.valid === true,
+      is403,
+      error: errorMsg || (data.valid ? 'OK' : 'Unknown validation failure')
+    };
+  } catch (err) {
+    return { healthy: false, is403: false, error: err.message };
+  }
+}
+
+async function deleteConnection(token, connectionId) {
+  try {
+    await apiRequest(`/api/providers/${encodeURIComponent(connectionId)}`, {
+      method: 'DELETE',
+      token,
+      timeout: 15000
+    });
+  } catch {}
 }
 
 async function clickFirst(page, selectors) {
@@ -273,7 +336,7 @@ function removeAccountFromFile(rawLine) {
 
   console.log(`\n======================================================`);
   console.log(`⚡ GSUITE2OMNI — AUTONOMOUS ACCOUNT PROVISIONER`);
-  console.log(`   By Zaki — Tiny Window (${WINDOW_WIDTH}x${WINDOW_HEIGHT}) & Fast Automation`);
+  console.log(`   By Zaki — Tiny Window (${WINDOW_WIDTH}x${WINDOW_HEIGHT}) & 403 Sensor Guard`);
   console.log(`======================================================\n`);
 
   process.stdout.write(`[*] Mengambil token autentikasi OmniRoute... `);
@@ -310,8 +373,25 @@ function removeAccountFromFile(rawLine) {
       const res = await exchangeToken(cliToken, { code, codeVerifier, state });
       console.log(`[OK]`);
 
-      console.log(`\n🎉 SUKSES! Akun ${email} berhasil terhubung ke OmniRoute!`);
-      if (res.connection?.id) console.log(`   Connection ID: ${res.connection.id}`);
+      const connectionId = res.connection?.id;
+      if (connectionId) {
+        process.stdout.write(`[*] Menjalankan sensor uji kesehatan 403... `);
+        await sleep(1500); // Beri jeda agar server menyimpan state
+        const health = await verifyConnectionHealth(cliToken, connectionId);
+
+        if (!health.healthy && health.is403) {
+          console.log(`[TERDETEKSI 403]`);
+          await deleteConnection(cliToken, connectionId);
+          console.log(`[*] Akun otomatis DIHAPUS dari OmniRoute.`);
+          await confirmContinueOn403(email, health.error);
+          return;
+        } else {
+          console.log(`[HEALTHY]`);
+        }
+      }
+
+      console.log(`\n🎉 SUKSES! Akun ${email} berhasil terhubung dan AKTIF di OmniRoute!`);
+      if (connectionId) console.log(`   Connection ID: ${connectionId}`);
     } catch (err) {
       console.error(`\n[✗] GAGAL: ${err.message}`);
     } finally {
@@ -335,14 +415,18 @@ function removeAccountFromFile(rawLine) {
   console.log(`\n[*] Mode: Bulk Provisioning`);
   console.log(`[*] Total antrean: ${accounts.length} akun`);
   console.log(`[*] Batch Size: ${concurrency} paralel`);
-  console.log(`[*] Window Size: SUPER KECIL (${WINDOW_WIDTH}x${WINDOW_HEIGHT} px)\n`);
+  console.log(`[*] Window Size: SUPER KECIL (${WINDOW_WIDTH}x${WINDOW_HEIGHT} px)`);
+  console.log(`[*] 403 Sensor Guard: AKTIF (Auto-Delete & Stop on 403)\n`);
 
   let successCount = 0;
   let failCount = 0;
+  let abortRequested = false;
   const failedList = [];
   const t0 = Date.now();
 
   for (let i = 0; i < accounts.length; i += concurrency) {
+    if (abortRequested) break;
+
     const batch = accounts.slice(i, i + concurrency);
     const browser = await Camoufox({
       headless: HEADLESS,
@@ -352,36 +436,65 @@ function removeAccountFromFile(rawLine) {
 
     try {
       await Promise.all(batch.map(async (acc, bIdx) => {
-        await sleep(bIdx * 1000); // 1s stagger agar koneksi lancar
+        if (abortRequested) return;
+
+        await sleep(bIdx * 1000); // Stagger ringan
         const idx = i + bIdx + 1;
         console.log(`[${idx}/${accounts.length}] Memproses ${acc.email}...`);
 
         let lastErr = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
+          if (abortRequested) return;
+
           try {
             const { authUrl, codeVerifier, state } = await startOAuth(cliToken);
             const code = await googleLogin(browser, authUrl, acc.email, acc.password);
-            await exchangeToken(cliToken, { code, codeVerifier, state });
+            const res = await exchangeToken(cliToken, { code, codeVerifier, state });
+
+            // SENSOR 403 CHECK
+            const connectionId = res.connection?.id;
+            if (connectionId) {
+              await sleep(1500);
+              const health = await verifyConnectionHealth(cliToken, connectionId);
+
+              if (!health.healthy && health.is403) {
+                await deleteConnection(cliToken, connectionId);
+                const shouldContinue = await confirmContinueOn403(acc.email, health.error);
+                if (!shouldContinue) {
+                  abortRequested = true;
+                  console.log(`\n[🛑] PROSES DIHENTIKAN OLEH USER / SENSOR 403.\n`);
+                  return;
+                }
+                failCount++;
+                failedList.push(acc.email);
+                return;
+              }
+            }
+
             successCount++;
-            console.log(`[✓] [${idx}/${accounts.length}] SUKSES: ${acc.email}`);
+            console.log(`[✓] [${idx}/${accounts.length}] SUKSES & HEALTHY: ${acc.email}`);
             removeAccountFromFile(acc.raw);
             return;
           } catch (e) {
             lastErr = e;
-            if (attempt < 3) {
+            if (attempt < 3 && !abortRequested) {
               console.log(`  [!] Retry ${acc.email} (${attempt + 1}/3): ${e.message.slice(0, 80)}`);
               await sleep(1500);
             }
           }
         }
 
-        failCount++;
-        failedList.push(acc.email);
-        console.error(`[✗] [${idx}/${accounts.length}] GAGAL: ${acc.email} (${lastErr?.message?.slice(0, 100)})`);
+        if (!abortRequested) {
+          failCount++;
+          failedList.push(acc.email);
+          console.error(`[✗] [${idx}/${accounts.length}] GAGAL: ${acc.email} (${lastErr?.message?.slice(0, 100)})`);
+        }
       }));
     } finally {
       await browser.close().catch(() => {});
     }
+
+    if (abortRequested) break;
 
     console.log(`\n--- Progress: Sukses ${successCount} | Gagal ${failCount} | Total Sisa: ${accounts.length - (i + batch.length)} ---\n`);
   }
@@ -391,5 +504,6 @@ function removeAccountFromFile(rawLine) {
   console.log(`🏁 SELESAI dalam ${elapsed} detik`);
   console.log(`   Sukses: ${successCount} akun`);
   console.log(`   Gagal : ${failCount} akun`);
+  if (abortRequested) console.log(`   Status: DIHENTIKAN DINI KARENA TERDETEKSI 403`);
   console.log(`======================================================\n`);
 })();
