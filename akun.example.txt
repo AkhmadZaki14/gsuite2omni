@@ -1,0 +1,7 @@
+# Format: email|password (atau email:password)
+# Satu akun per baris
+# Akun yang berhasil di-provisioning akan otomatis dihapus dari file ini.
+
+user1@yourdomain.com|rahasia123
+user2@yourdomain.com|rahasia123
+user3@yourdomain.com|rahasia123

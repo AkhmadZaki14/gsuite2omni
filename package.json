@@ -1,0 +1,33 @@
+{
+  "name": "gsuite2omni",
+  "version": "1.0.0",
+  "description": "Autonomous bulk GSuite & Google account provisioner for OmniRoute AI router by Zaki",
+  "main": "index.js",
+  "bin": {
+    "gsuite2omni": "./index.js"
+  },
+  "scripts": {
+    "start": "node src/bot.js",
+    "add": "node src/bot.js",
+    "add:camoufox": "node src/bot.js",
+    "status": "node src/status.js",
+    "delete": "node src/delete.js",
+    "test": "node src/status.js"
+  },
+  "keywords": [
+    "omniroute",
+    "gsuite",
+    "google-workspace",
+    "antigravity",
+    "ai-router",
+    "camoufox",
+    "playwright",
+    "automation",
+    "oauth"
+  ],
+  "author": "Akhmad Zaki",
+  "license": "MIT",
+  "dependencies": {
+    "camoufox-js": "^0.12.0"
+  }
+}

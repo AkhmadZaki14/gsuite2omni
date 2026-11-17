@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Credentials & Sensitive Files
+akun.txt
+akun_sisa.txt
+*.bak
+*.env
+.env*
+!akun.example.txt
+
+# Logs & Screenshots
+*.log
+debug-*.png
+fail-*.png
+*.png
+
+# OS Files
+.DS_Store
+Thumbs.db
