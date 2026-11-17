@@ -1,6 +1,7 @@
 const { Camoufox } = require('camoufox-js');
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 const { getOmniRouteCliToken } = require('./token');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -13,7 +14,22 @@ const WINDOW_WIDTH = 480;
 const WINDOW_HEIGHT = 650;
 const HEADLESS = process.env.HEADLESS === 'true'; // Default visible browser mode
 
-// Helper fungsi HTTP request ke OmniRoute API
+// Tanya user jumlah batch / concurrency jika tidak dioper di argv
+async function askConcurrency(defaultVal = 10) {
+  if (!process.stdin.isTTY) return defaultVal;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`\n[?] Mau jalan berapa paralel per batch? (Rekomendasi: 10 atau 15) [default: ${defaultVal}]: `, (ans) => {
+      rl.close();
+      const val = ans.trim();
+      if (!val) return resolve(defaultVal);
+      const parsed = parseInt(val, 10);
+      resolve(parsed > 0 ? parsed : defaultVal);
+    });
+  });
+}
+
+// Helper HTTP request ke OmniRoute API
 async function apiRequest(endpoint, { method = 'GET', body, token, timeout = 30000 } = {}) {
   const url = `${ROUTER_URL}${endpoint}`;
   const controller = new AbortController();
@@ -51,7 +67,7 @@ async function startOAuth(token) {
   return { authUrl, codeVerifier, state };
 }
 
-async function exchangeToken(token, { code, codeVerifier, state }, retries = 3) {
+async function exchangeToken(token, { code, codeVerifier, state }, retries = 4) {
   let lastErr = null;
   for (let a = 0; a < retries; a++) {
     try {
@@ -67,10 +83,33 @@ async function exchangeToken(token, { code, codeVerifier, state }, retries = 3) 
       return res.data;
     } catch (e) {
       lastErr = e;
-      if (a < retries - 1) await sleep(2000);
+      if (a < retries - 1) await sleep(1500 * (a + 1));
     }
   }
   throw lastErr;
+}
+
+// Fast DOM-Level Input (Zero Keystroke Lag)
+async function fastInput(page, selector, value) {
+  await page.waitForSelector(selector, { state: 'visible', timeout: 15000 });
+  await page.click(selector, { timeout: 1500 }).catch(() => {});
+  
+  // Direct DOM dispatching — 0ms lag
+  await page.evaluate(({ sel, val }) => {
+    const el = document.querySelector(sel);
+    if (el) {
+      el.focus();
+      el.value = val;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }, { sel: selector, val: value });
+
+  // Fallback check
+  const actual = await page.$eval(selector, el => el.value).catch(() => '');
+  if (actual !== value) {
+    await page.fill(selector, value);
+  }
 }
 
 async function clickFirst(page, selectors) {
@@ -78,7 +117,7 @@ async function clickFirst(page, selectors) {
     try {
       const el = await page.$(sel);
       if (el && await el.isVisible()) {
-        await el.click({ timeout: 1200 });
+        await el.click({ timeout: 1000 });
         return true;
       }
     } catch {}
@@ -99,6 +138,8 @@ async function googleLogin(browser, authUrl, email, password) {
   const page = await context.newPage();
   try {
     let authCode = null;
+
+    // Abort media, fonts & trackers untuk performa kilat (Fast Load)
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (u.startsWith(REDIRECT_URI)) {
@@ -106,65 +147,53 @@ async function googleLogin(browser, authUrl, email, password) {
         route.abort();
         return;
       }
-      if (['image', 'font', 'media'].includes(route.request().resourceType())) {
+      const type = route.request().resourceType();
+      if (['image', 'font', 'media'].includes(type) || u.includes('google-analytics') || u.includes('doubleclick')) {
         route.abort();
         return;
       }
       route.continue();
     });
 
-    await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
     if (authCode) return authCode;
 
-    // 1. Ketik Email
-    await page.waitForSelector('#identifierId', { state: 'visible', timeout: 20000 });
-    await sleep(500);
-    await page.click('#identifierId');
-    await sleep(200);
-    await page.fill('#identifierId', email);
-
-    let val = await page.$eval('#identifierId', el => el.value).catch(() => '');
-    if (val !== email) {
-      await page.focus('#identifierId');
-      await page.keyboard.press('Meta+A');
-      await page.keyboard.press('Backspace');
-      await page.type('#identifierId', email, { delay: 35 });
-    }
-    await sleep(800);
+    // 1. Ketik Email Kilat (Fast Input)
+    await fastInput(page, '#identifierId', email);
+    await sleep(250);
 
     const emailNext = await clickFirst(page, ['#identifierNext', '#identifierNext button', 'button:has-text("Next")', 'button:has-text("Berikutnya")']);
     if (!emailNext) await page.keyboard.press('Enter');
-    await sleep(2500);
 
-    // 2. Menunggu & Ketik Password
+    // 2. Menunggu & Ketik Password Kilat
     for (let a = 0; a < 15; a++) {
       const u = page.url();
       if (!u.includes('/identifier') || u.includes('/challenge') || u.includes('/pwd')) break;
       if (await page.$('input[type="password"]')) break;
-      await sleep(1000);
+      await sleep(400);
     }
 
-    let pwdField = null;
-    for (const sel of ['input[type="password"][name="Passwd"]', 'input[type="password"]', '#password input', 'input[name="Passwd"]', 'div[role="form"] input[type="password"]']) {
-      try { pwdField = await page.waitForSelector(sel, { state: 'visible', timeout: 8000 }); if (pwdField) break; }
-      catch {}
+    let pwdSelector = null;
+    for (const sel of ['input[type="password"][name="Passwd"]', 'input[type="password"]', '#password input', 'input[name="Passwd"]']) {
+      try {
+        const el = await page.waitForSelector(sel, { state: 'visible', timeout: 6000 });
+        if (el) { pwdSelector = sel; break; }
+      } catch {}
     }
-    if (!pwdField) {
+
+    if (!pwdSelector) {
       const dbgPath = path.resolve(__dirname, `../debug-${email.split('@')[0]}.png`);
       await page.screenshot({ path: dbgPath, fullPage: true });
-      throw new Error(`Password field tidak ditemukan, screenshot disimpan ke ${dbgPath}`);
+      throw new Error(`Password field tidak ditemukan, URL: ${page.url()}`);
     }
 
-    await sleep(500);
-    await pwdField.click();
-    await sleep(200);
-    await pwdField.fill(password);
-    await sleep(800);
+    await fastInput(page, pwdSelector, password);
+    await sleep(250);
 
     const pwdNext = await clickFirst(page, ['#passwordNext', '#passwordNext button', 'button:has-text("Next")', 'button:has-text("Berikutnya")']);
     if (!pwdNext) await page.keyboard.press('Enter');
 
-    // 3. Menunggu Persetujuan & Bypass Speedbump ("Pastikan Anda mendownload aplikasi ini dari Google")
+    // 3. Fast Auto-Bypass Security Speedbump & Consent ("Pastikan Anda mendownload aplikasi ini dari Google")
     const CONSENT = [
       '#accept', '#agree', '#submit_approve_access', '#tos-accept-button', 'button[type="submit"]',
       'button:has-text("Lanjutkan")', 'button:has-text("Continue")', 'button:has-text("Tetap login")',
@@ -174,8 +203,7 @@ async function googleLogin(browser, authUrl, email, password) {
       'button:has-text("Next")', 'button:has-text("Berikutnya")',
       'button:has-text("Allow")', 'button:has-text("Izinkan")',
       'span:has-text("Lanjutkan")', 'span:has-text("Continue")', 'span:has-text("Saya mengerti")',
-      'span:has-text("Accept")', 'span:has-text("Agree")', 'span:has-text("Setuju")', 'span:has-text("Lanjut")',
-      'span:has-text("Allow")', 'span:has-text("Izinkan")',
+      'span:has-text("Accept")', 'span:has-text("Agree")', 'span:has-text("Setuju")',
       'div[role="button"]:has-text("Lanjutkan")', 'div[role="button"]:has-text("Continue")',
       'div[role="button"]:has-text("Saya mengerti")', 'div[role="button"]:has-text("Accept")',
       'div[role="button"]:has-text("Agree")', 'div[role="button"]:has-text("Setuju")',
@@ -183,36 +211,41 @@ async function googleLogin(browser, authUrl, email, password) {
     ];
 
     const t0 = Date.now();
-    while (!authCode && Date.now() - t0 < 60000) {
+    while (!authCode && Date.now() - t0 < 50000) {
       if (page.url().startsWith(REDIRECT_URI)) {
         try { authCode = new URL(page.url()).searchParams.get('code'); } catch {}
         if (authCode) break;
       }
 
-      // Handle DOM speedbump & Google security warning modal
+      // DOM Scan & Instant Click untuk Speedbump / Warning Google
       try {
-        await page.evaluate(() => {
+        const clicked = await page.evaluate(() => {
           window.scrollTo(0, document.body.scrollHeight);
           const buttons = Array.from(document.querySelectorAll('button, div[role="button"], input[type="submit"], a[role="button"]'));
           for (const b of buttons) {
-            const txt = (b.innerText || b.value || '').toLowerCase();
+            const txt = (b.innerText || b.value || '').toLowerCase().trim();
             if (
               txt.includes('lanjutkan') || txt.includes('continue') ||
               txt.includes('mengerti') || txt.includes('paham') ||
               txt.includes('tetap') || txt.includes('allow') ||
               txt.includes('izinkan') || txt.includes('agree') ||
-              txt.includes('setuju') || txt.includes('next') ||
-              txt.includes('berikutnya')
+              txt.includes('setuju') || txt === 'next' ||
+              txt === 'berikutnya'
             ) {
               b.click();
-              break;
+              return true;
             }
           }
+          return false;
         });
+        if (clicked) {
+          await sleep(400);
+          continue;
+        }
       } catch {}
 
       await clickFirst(page, CONSENT);
-      await sleep(1000);
+      await sleep(350);
     }
 
     if (!authCode) {
@@ -252,14 +285,14 @@ function removeAccountFromFile(rawLine) {
   fs.writeFileSync(AKUN_FILE, filtered);
 }
 
-// MAIN FUNCTION
+// MAIN EXECUTION
 (async () => {
   const args = process.argv.slice(2);
   const isSingle = args.length >= 2 && args[0].includes('@');
 
   console.log(`\n======================================================`);
   console.log(`⚡ GSUITE2OMNI — AUTONOMOUS ACCOUNT PROVISIONER`);
-  console.log(`   By Zaki — Powered by Camoufox Anti-Detect`);
+  console.log(`   By Zaki — Ultra-Fast & Camoufox Anti-Detect`);
   console.log(`======================================================\n`);
 
   // 1. Ambil CLI Token OmniRoute
@@ -316,10 +349,17 @@ function removeAccountFromFile(rawLine) {
     process.exit(0);
   }
 
-  const concurrency = parseInt(args[0] || '3', 10) || 3;
-  console.log(`[*] Mode: Bulk Provisioning`);
+  // Tentukan concurrency: gunakan CLI arg jika ada, atau prompt interaktif (default: 10)
+  let concurrency = args[0] ? parseInt(args[0], 10) : null;
+  if (!concurrency || isNaN(concurrency)) {
+    concurrency = await askConcurrency(10);
+  }
+
+  console.log(`\n[*] Mode: Bulk Provisioning`);
   console.log(`[*] Total antrean: ${accounts.length} akun`);
-  console.log(`[*] Concurrency: ${concurrency} paralel\n`);
+  console.log(`[*] Batch Size / Concurrency: ${concurrency} paralel`);
+  console.log(`[*] Speed: Ultra-Fast DOM Input (Zero Keystroke Lag)`);
+  console.log(`[*] Window: Mini (${WINDOW_WIDTH}x${WINDOW_HEIGHT})\n`);
 
   let successCount = 0;
   let failCount = 0;
@@ -336,7 +376,7 @@ function removeAccountFromFile(rawLine) {
 
     try {
       await Promise.all(batch.map(async (acc, bIdx) => {
-        await sleep(bIdx * 1500); // stagger agar tidak request serentak
+        await sleep(bIdx * 800); // Stagger ringan agar exchange tidak tabrakan
         const idx = i + bIdx + 1;
         console.log(`[${idx}/${accounts.length}] Memproses ${acc.email}...`);
 
@@ -353,15 +393,15 @@ function removeAccountFromFile(rawLine) {
           } catch (e) {
             lastErr = e;
             if (attempt < 3) {
-              console.log(`  [!] Retry ${acc.email} (Percobaan ${attempt + 1}/3): ${e.message.slice(0, 100)}`);
-              await sleep(2000);
+              console.log(`  [!] Retry ${acc.email} (${attempt + 1}/3): ${e.message.slice(0, 80)}`);
+              await sleep(1500);
             }
           }
         }
 
         failCount++;
         failedList.push(acc.email);
-        console.error(`[✗] [${idx}/${accounts.length}] GAGAL: ${acc.email} (${lastErr?.message?.slice(0, 150)})`);
+        console.error(`[✗] [${idx}/${accounts.length}] GAGAL: ${acc.email} (${lastErr?.message?.slice(0, 120)})`);
       }));
     } finally {
       await browser.close().catch(() => {});
